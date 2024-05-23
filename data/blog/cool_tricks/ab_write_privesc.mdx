@@ -1,7 +1,78 @@
 ---
-title: What to do when you have "not-fully-controllable" arbitrary privileged write
+title: When GTFOBin doesn't work, time to put in some effort!
 date: '2024-05-20'
 tags: ['privesc', 'cool_trick']
 draft: false
-summary: Underated 20+ years old trick
+summary: Getting root shell when you have "not-fully-controllable" arbitrary privileged write
 ---
+
+# Settings
+
+Imagine getting a non-privileged shell on a system. You want to demonstrate more catastrophic consequences by getting a root shell. After countless hours of enumeration (or just a few seconds for [linpeas]() to finish), you found the **nmap** binary with SUID. You thought to yourself: Piece of cake🎂🎂🎂
+
+However, when you tried [GTFO](https://gtfobins.github.io/gtfobins/nmap/) stuff it doesn't give you shell immediately. No problem, you soon realized you have arbitrary read and kind of an "ugly write". Leaking files is pretty cool. For the writing part, the output is specifically structured, in other words along with your malicious inputs, you also write in a bunch of junk. You can't really cleanly modify /etc/shadow, no easy cron binaries, ... Do you really need to pull some xz type backdoor then? How do you get shell?
+
+There's at least 2 easy ways. I'll explain the easiest way.
+
+Let's just look at this little code snippet from glibc/pwd/fgetpwent.c:
+```
+/* Read one entry from the given stream.  */
+int
+__fgetpwent_r (FILE *stream, struct passwd *resbuf, char *buffer,
+	       size_t buflen, struct passwd **result)
+{
+  char *p;
+
+  flockfile (stream);
+  do
+    {
+      buffer[buflen - 1] = '\xff';
+      p = fgets_unlocked (buffer, buflen, stream);
+      if (p == NULL && feof_unlocked (stream))
+	{
+	  funlockfile (stream);
+	  *result = NULL;
+	  __set_errno (ENOENT);
+	  return errno;
+	}
+      if (p == NULL || buffer[buflen - 1] != '\xff')
+	{
+	  funlockfile (stream);
+	  *result = NULL;
+	  __set_errno (ERANGE);
+	  return errno;
+	}
+
+      /* Skip leading blanks.  */
+      while (isspace (*p))
+	++p;
+    } while (*p == '\0' || *p == '#' ||	/* Ignore empty and comment lines.  */
+	     /* Parse the line.  If it is invalid, loop to
+		get the next line of the file to parse.  */
+	     ! parse_line (p, resbuf, (void *) buffer, buflen, &errno));
+
+  funlockfile (stream);
+
+  *result = resbuf;
+  return 0;
+}
+```
+
+See that "If it is invalid, loop to get the next line of the file to parse" part? This is the logic parsing the /etc/passwd file. Did you get the idea yet? As long as we can append to /etc/passwd, a malicious entry amongst some other garbages is good enough.
+
+Now we know to use SUID nmap to write to /etc/passwd, let's get to the detail. I found this little [writing](https://synfin.net/papers/nmap-suid.txt) that dated back from 2001. Here's the summary:
+- There's this *--append-output* and *-oN* (normal output format) flag which serves our use case.
+- nmap-services is a file specifying which service is on which port. Before defaulting, nmap looks for this file in the path specified by $NMAPDIR
+- You need to have a host with an open port (most likely trivial, you can just take localhost because after all, how did you gain initial foothold?)
+
+If you don't know what to write, I suggest you lookup the syntax of /etc/passwd. So here's the step to gain the shell:
+- set the $NMAPDIR variable to a path you want
+- write a valid and malicious nmap-services file in the directory
+- Execute nmap with --append-output -oN /etc/passwd
+- Win  
+
+![Nmap SUID to root shell](/static/images/nmap.png)
+
+The second method is to write stuff into /etc/ld.so.preload. That's a bit trickier, so in another post I'll explain that technique in a situation where writing to /etc/passwd doesn't work.
+
+Thanks for reading and happy hacking!
