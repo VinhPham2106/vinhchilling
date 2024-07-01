@@ -1,0 +1,344 @@
+---
+title: UIUCTF 2024 Writeups
+date: '2024-07-01'
+tags: ['livectfs', 'writeups', 'privesc']
+draft: false
+summary: Writeups for challenges I solved.
+---
+
+# Prologue
+
+Yet another CTF weekend, and this time b01lers competed in Sigpwny's UIUCTF24, securing rank 22 (top 3%). I solved 2 webs, a rev and a crypto while contributing to some others. Admittedly, I wasn't able to solve a super difficult one. Still, I want to share some interesting stuff I learned along the way!
+
+# Web challenges
+## Fare Evasion (Easy, 370 points, 173 solves)
+
+This is a no source web challege. As always I did some enums, but there were only 2 notable things. There's this stuff when I view page source:
+```
+<script>
+    async function pay() {
+      // i could not get sqlite to work on the frontend :(
+      /*
+        db.each(`SELECT * FROM keys WHERE kid = '${md5(headerKid)}'`, (err, row) => {
+        ???????
+       */
+      const r = await fetch("/pay", { method: "POST" });
+      const j = await r.json();
+      document.getElementById("alert").classList.add("opacity-100");
+      // todo: convert md5 to hex string instead of latin1??
+      document.getElementById("alert").innerText = j["message"];
+      setTimeout(() => { document.getElementById("alert").classList.remove("opacity-100") }, 5000);
+    }
+ </script>
+```
+And the POST /pay endpoint where you provide the JWT to get a message back. If you provide the default given JWT, you get the following responses:
+```http
+HTTP/2 200 OK
+Content-Type: application/json
+Date: Sat, 29 Jun 2024 02:51:13 GMT
+Server: hypercorn-h11
+Content-Length: 235
+
+{"message":"Sorry passenger, only conductors are allowed right now. 
+Please sign your own tickets. \nhashed _\bR\u00f2\u001es\u00dcx\u00c9\u00c4\u0002\u00c5\u00b4\u0012\\\u00e4
+secret: a_boring_passenger_signing_key_?","success":false}
+```
+Seems like you're given the signing key and some hash, but's sent in some utf-8 format
+
+I quickly check the payload of the JWT. I recommend [this website](https://jwt.io/) when playing with JWT manually.
+```
+# Header  
+{
+  "alg": "HS256",
+  "kid": "passenger_key",
+  "typ": "JWT"
+}
+
+# Payload 
+{
+  "type": "passenger"
+}
+```
+
+The website mentioned above confirmed that the signing key "a_boring_passenger_signing_key_?" is indeed a correct one. One more thing to think about, what's this "\u" utf-8 hash thingy. My thought was that sending the response messes up to encoding, and I needed to find a way to extract the hex string. Using my fresh and full GPT-4o free credit, I managed to have this script extract the hexstring for me:
+```py 
+import re
+
+# Input string
+input_string = "" # Replace with hash string here
+
+# Function to convert unicode escape sequences to characters
+def unicode_escape_to_char(match):
+    return chr(int(match.group(1), 16))
+
+# Replace unicode escape sequences with actual characters
+decoded_string = re.sub(r'\\u([0-9a-fA-F]{4})', unicode_escape_to_char, input_string)
+
+# Convert characters to hex string
+hex_string = ''.join(f'{ord(c):02x}' for c in decoded_string)
+
+print("Decoded String:", decoded_string)
+print("Hex String:", hex_string)
+```
+
+Getting the hex string, I confirmed that it's the md5 of the signing key. After trying multiple JWT known tricks, such as **alg None**, with no success, I started playing around with the signature part and the "kid" field. Leaving the "kid" blank gives you this:
+```http
+HTTP/2 200 OK
+Content-Type: application/json
+Date: Mon, 01 Jul 2024 10:06:16 GMT
+Server: hypercorn-h11
+Content-Length: 66
+
+{"message":"the query contains a null character","success":false}
+```
+
+And surprising changing "kid" to "abcd" gives you this:
+```http
+HTTP/2 200 OK
+Content-Type: application/json
+Date: Mon, 01 Jul 2024 10:09:10 GMT
+Server: hypercorn-h11
+Content-Length: 85
+
+{"message":"near \"\u00ee\u0093\u0095\u00f3$\u00cd\": syntax error","success":false}
+```
+
+At this point I had an idea of what's been going on on the backend. The unprepared query finds the signing key based off the md5 of the KID. However, if the md5 contains something like double quote, it breaks the query. The null message is also a generic SQL error message.
+
+No I'm definitely not hashclashing this, so I googled and found this [CTF challenge](https://cvk.posthaven.com/sql-injection-with-raw-md5-hashes) that has the same idea, but in PHP. 
+
+Uhm, at this point, nothing more sadly. SQL injection using the payload from the writeup as KID gives me the signing key for conductor. Using that same KID (so that the app checks the JWT using the conductor key), changing payload to "conductor" type, we got our juice flag.
+
+## Log Action (Easy, 431 points, 105 solves)
+
+There's not much to this honestly. When I see NextJS, I immediately looked at "package.json" and see "14.1.0". The vulnerability is SSRF, explained in this awesomely detailed [writeup](https://www.assetnote.io/resources/research/digging-for-ssrf-in-nextjs-apps). The "/logout" endpoint fits the conditions required for SSRF, so most of the solve was just following the writeup.
+
+One new thing that I learned is with how these containers communicate when trying to find which endpoint to fetch for SSRF. Take a look at this compose file:
+```
+version: '3'
+services:
+  frontend:
+    build: ./frontend
+    restart: always
+    environment:
+      - AUTH_TRUST_HOST=http://localhost:3000
+    ports:
+      - "3000:3000"
+    depends_on:
+      - backend
+  backend:
+    image: nginx:latest
+    restart: always
+    volumes:
+      - ./backend/flag.txt:/usr/share/nginx/html/flag.txt
+```
+
+From the [Docker Compose Networking documentation](https://docs.docker.com/compose/networking/): 
+
+"By default Compose sets up a single network for your app. Each container for a service joins the default network and is both reachable by other containers on that network, and discoverable by the service's name."
+
+So the vulnerable NextJS frontend can fetch flag.txt at **http://backend/flag.txt**.
+
+Only new thing I learned from this challenge is that!
+
+# Crypto Challenges
+
+## Key in a Haystack (Medium, 461 points, 65 solves)
+
+Server code:
+```py
+from Crypto.Util.number import getPrime
+from Crypto.Util.Padding import pad
+from Crypto.Cipher import AES
+
+from hashlib import md5
+from math import prod
+import sys
+
+from secret import flag
+
+key = getPrime(40)
+haystack = [ getPrime(1024) for _ in range(300) ]
+key_in_haystack = key * prod(haystack)
+
+enc_flag = AES.new(
+	key = md5(b"%d" % key).digest(),
+	mode = AES.MODE_ECB
+).encrypt(pad(flag, 16))
+
+sys.set_int_max_str_digits(0)
+
+print(f"enc_flag: {enc_flag.hex()}")
+print(f"haystack: {key_in_haystack}")
+
+exit(0)
+```
+
+A bit troll in my honest opinion. The key is multiplied with 300 1024-bit primes into this gigantic 90000+ digit number (The Haystack). So there're a few ways to solve this:
+- Pohlig Hellman factorization: Can get the smallest factor in time proportion to square root of that factor
+- Bruteforcing all the 40 bit primes and check for the "uiuc" start. Optimize using the 6k+1 and 6k-1 property of odd primes. Honestly the best approach.
+- Use some crazy website that accept to factor this number.
+
+The thing is, I get the flag from this third option. [This website](https://www.alpertron.com.ar/ECM.HTM) lets me paste in that 90000+ digit number, try to factorize it. I literally left my laptop to go to a party and came back, and I got the smallest prime factor (the key) in a bit over 6 hours (or less).
+
+Honestly bruteforcing with something like multithreaded Rust would be faster (like 2-3 hours). Pohlig Hellman facotization could be the way, but I checked that Python deals with this 90000 digit number very slow, and ?this method cannot me multithread? unless checking multiple seeds and functions.
+
+
+# Reverse Engineering Challenges 
+## Summarize (Easy, 381 points, 161 solves)
+
+### Summary
+The binary requires you to give it 6 9-digit numbers. If correct, the flag is given to us. We can't just use a debugger to bypass the checks, because the flag is contructed based on the entered numbers, so wrong numbers wrong flag. Stripped binary so a bit annoying.
+
+### Analyis of the checker function
+Ghidra pure disassembly of the check function
+```c 
+undefined4
+FUN_0040137b(uint param_1,uint param_2,uint param_3,uint param_4,uint param_5,uint param_6)
+
+{
+  undefined4 uVar1;
+  uint uVar2;
+  uint uVar3;
+  undefined4 uVar4;
+  uint uVar5;
+  uint uVar6;
+  uint uVar7;
+  uint uVar8;
+  uint uVar9;
+  uint uVar10;
+  ulong uVar11;
+  
+  if (((((param_1 < 0x5f5e101) || (param_2 < 0x5f5e101)) || (param_3 < 0x5f5e101)) ||
+      ((param_4 < 0x5f5e101 || (param_5 < 0x5f5e101)))) || (param_6 < 0x5f5e101)) {
+    uVar1 = 0;
+  }
+  else if (((param_1 < 1000000000) && (param_2 < 1000000000)) &&
+          ((param_3 < 1000000000 &&
+           (((param_4 < 1000000000 && (param_5 < 1000000000)) && (param_6 < 1000000000)))))) {
+    uVar1 = FUN_004016d8(param_1,param_2);
+    uVar2 = FUN_0040163d(uVar1,param_3);
+    uVar3 = FUN_0040163d(param_1,param_2);
+    uVar1 = FUN_004016fe(2,param_2);
+    uVar4 = FUN_004016fe(3,param_1);
+    uVar5 = FUN_004016d8(uVar4,uVar1);
+    uVar6 = FUN_0040174a(param_1,param_4);
+    uVar1 = FUN_0040163d(param_3,param_1);
+    uVar7 = FUN_004017a9(param_2,uVar1);
+    uVar11 = FUN_0040163d(param_2,param_4);
+    uVar1 = FUN_0040163d(param_4,param_6);
+    uVar8 = FUN_0040174a(param_3,uVar1);
+    uVar9 = FUN_004016d8(param_5,param_6);
+    uVar10 = FUN_0040163d(param_5,param_6);
+    if ((((uVar2 % 0x10ae961 == 0x3f29b9) && (uVar3 % 0x1093a1d == 0x8bdcd2)) &&
+        ((uVar5 % uVar6 == 0x212c944d &&
+         ((uVar7 % 0x6e22 == 0x31be && ((int)((uVar11 & 0xffffffff) % (ulong)param_1) == 0x2038c4 3c)
+          ))))) &&
+       ((uVar8 % 0x1ce628 == 0x1386e2 &&
+        ((uVar9 % 0x1172502 == 0x103cf4f && (uVar10 % 0x2e16f83 == 0x16ab0d7)))))) {
+      uVar1 = 1;
+    }
+    else {
+      uVar1 = 0;
+    }
+  }
+  else {
+    uVar1 = 0;
+  }
+  return uVar1;
+}
+```
+
+The first portion checks whether the number are 9 digits by upper and lower bound. We need to check the functions creating uVar1 to uVar10. Let's take a look at FUNC_004016d8:
+
+```c 
+void FUN_004016d8(undefined4 param_1,int param_2)
+
+{
+  FUN_0040163d(param_1,-param_2);
+  return;
+}
+```
+
+Hmm, calls another one but negates param_2. Let's follow through:
+```c 
+long FUN_0040163d(uint param_1,uint param_2)
+
+{
+  byte bVar1;
+  uint uVar2;
+  uint uVar3;
+  uint local_30;
+  uint local_2c;
+  uint local_20;
+  long local_10;
+  
+  local_10 = 0;
+  local_20 = 0;
+  bVar1 = 0;
+  local_2c = param_1;
+  for (local_30 = param_2; (local_2c != 0 || (local_30 != 0)); local_30 = local_30 >> 1) {
+    uVar2 = local_2c & 1;
+    uVar3 = local_30 & 1;
+    local_2c = local_2c >> 1;
+    local_10 = local_10 + (ulong)((uVar2 ^ uVar3 ^ local_20) << (bVar1 & 0x1f));
+    local_20 = uVar3 & local_20 | uVar2 & (uVar3 | local_20);
+    bVar1 = bVar1 + 1;
+  }
+  return local_10 + ((ulong)local_20 << (bVar1 & 0x3f));
+}
+```
+
+Got it? Corresponding bit adding, and left-shifting to correct power of 2. This is 64-bit addition, which makes the function calling this above 64-bit subtraction. 
+
+Checking the other ones reveal them to be XOR, AND, MULT. 
+
+### Getting the right number
+I didn't get all the conditions from ghidra, the disassembly is too ugly. So I pivot to Binary Ninja to get the conditions, plug them into z3 and get the numbers. The numbers were spitted out instantly.
+```py
+from z3 import *
+
+# Create a Z3 solver instance
+solver = Solver()
+
+# Define variables as Bit-Vectors
+a, b, c, d, e, f = BitVecs('a b c d e f', 64)
+
+# Add constraints
+solver.add(a > 100000001)
+solver.add(b > 100000001)
+solver.add(c > 100000001)
+solver.add(d > 100000001)
+solver.add(e > 100000001)
+solver.add(f > 100000001)
+solver.add(a < 1000000000)
+solver.add(b < 1000000000)
+solver.add(c < 1000000000)
+solver.add(d < 1000000000)
+solver.add(e < 1000000000)
+solver.add(f < 1000000000)
+solver.add((a - b + c) % 17492321 == 4139449)
+solver.add((a + b) % 17381917 == 9166034)
+solver.add((3*a - 2*b) % (a ^ d) == 556569677)
+solver.add((b & (c + a)) % 28194 == 12734)
+solver.add((b + d) % a == 540591164)
+solver.add((c ^ (d + f)) % 1893928 == 1279714)
+solver.add((e - f) % 18294018 == 17026895)
+solver.add((e + f) % 48328579 == 23769303)
+
+# Check if there is a solution
+if solver.check() == sat:
+    model = solver.model()
+    print("Solution found:")
+    print(f"a = {model[a].as_long()}")
+    print(f"b = {model[b].as_long()}")
+    print(f"c = {model[c].as_long()}")
+    print(f"d = {model[d].as_long()}")
+    print(f"e = {model[e].as_long()}")
+    print(f"f = {model[f].as_long()}")
+else:
+    print("No solution found.")
+```
+Then just run the binary, provided the correct number, and win!
+
+## HAPPY HACKING. SOMETHING NEW IS COMING SOON!
