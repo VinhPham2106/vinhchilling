@@ -1,0 +1,198 @@
+---
+title: "Google Summer of Code 2024 Project: Enhancing OWASP's Web Testing Framework Enumeration Plugins"
+date: '2024-08-25'
+tags: ["projects", "web"]
+draft: false
+summary: Detail recap of my GSOC 24 output and overall experience
+---
+
+# Summary
+
+This summer, I had the privilege to work on a mentored project with the OWASP Foundation (urghh, sorry if it sounds like those LinkedIn posts).
+I tried to find a security project to work with, and chose OWASP. I wanted to work on web-focused stuff, thus after crossing out options like Juice Shop, DWVA, and a really cool network attack tool project, I ended up with OWTF.
+Yes, it stands for OWASP's Web Testing Framework, not Oh, WTF. 
+
+All the way back in February, I spun up the Docker version of the tool, tested it out and raised a few Issues and PRs fixing various bugs. 
+Next, I wrote a proposal, got excepted and start working on my project. OWTF is an old project, dating back to the beginning of the 2010s. 
+Thus outdated tools, dependency issues, breaking changes plagued the tool. My project focused on addressing those issues with special attention to the enumeration process. 
+
+# Project milestones
+
+The basic overview of the project can be viewed on the Official GSoC 2024 [page](https://summerofcode.withgoogle.com/programs/2024/projects/tN4HyoGJ). I will summarized the work done here:
+- Found the JWT error preventing users from logging in and using OWTF. Tested an existing PR that solved the issue and pinged the maintainer. [Commits](https://github.com/owtf/owtf/commit/caff1694fbe559f00c05f947a89b8e9ab92d8bd4) merged March 1st, 2024
+- Tested some Information Gathering tools and found errors with **theHarvester** and **metagoofil**. After fixing the bugs, the GitHub CI test fails. Investigated the issue and bump outdated github action. [Commits](https://github.com/owtf/owtf/commit/97c291fe695eab3742261bf34071289d86e17c06) merged March 25th, 2024
+- Found that recent merged dependancybot's commits broke the webUI. Also problems with transaction page not showing and broken links to file server. [Bug fixing commits](https://github.com/owtf/owtf/commit/56199c8fe047b51d7750fdf856908ef1f0ba2431) merged June 30th, 2024
+- Big update for the Information Gathering plugins. [All the work](https://github.com/owtf/owtf/commit/402f8f8db6fd53cb47c5a438f92dec8826a2ac98) merged on August 15th, 2024
+- Wiki updates and finalization done along with this blog post.
+
+# Technical Details
+
+## 0. A Tour of OWTF
+The high level overview consists of the following components:
+- **ReactJS frontend**: being the web interface
+- **Python Backend**: core api to evoke tools, manage workers, worklists.
+- **A [python-tornado](https://www.tornadoweb.org/en/stable/) proxy server**: A Man-in-The-Middle to record transactions with the targets.
+- **A [python-tornado](https://www.tornadoweb.org/en/stable/) file server**: Allow users to view output files on the web.
+- **PostgreSQL database**: Storing Auth, transactions, plugins, etc data.
+
+OWTF uses several **yaml** files to load configurations and tools information. They can be found at `/owtf/data/conf` or `/scripts`. The OWTF python executable runs in a virtualenv for easy dependency management, although there might be problems with some python tools that have conflicting dependencies.
+`/scripts/install.sh` is an important script as it creates the directory structure, build the proxy and webapp. 
+
+OWTF's tools are grouped into what are called plugins so that tools of similar purposes can all run together in an organized manner. An average thorough web testing engagement involves lots of tools, so pentesters do not want to run them one by one.
+Plugins can be **Active**, **Semi-passive** or **Passive**, depending on whether they interact with the target servers directly. There's also a mode call **External**. Tho it won't run anything, it lists out links, resources related to the aspects you're testing.
+
+When users run a plugin, that task is assigned to the worklist of a worker which you can see its logs. It's just one click to add/remove, pause/continue workers and worklists. 
+
+
+## 1. Analyzing all the webapp bugs fixed
+briefly jwt, then nodejs breaking change, then the little webserver detail, then transactions
+### 1.1 JWT error
+
+The first change that got me involved in the development of OWTF was a simple yet significant JWT error. 
+Basically, some changes in the **jwt** python library breaks the authentication and authorization part of OWTF. Specifically, `jwt.encode()` previously returns a byte string, so OWTF was converting it to a string using `.decode()`.
+Now `jwt.encode()` returns a string, which causes the an error that triggers the `except` branch and fails the auth process. Also, when using the `jwt.decode()` method, the algorithm must specify the **algorithms** parameter to be consistent with what is used to encode.
+I found out about the bytes and strings issue by some debuggin print statement, and after removing the `decode()` part, I was about to raise a PR when I saw another PR addressing the same issue. 
+I then pinged the maintainers, and the fix was merged. 
+
+Here are the important parts of the PR:
+```py
+# before 
+payload = jwt.decode(token, JWT_SECRET_KEY, options=JWT_OPTIONS)
+# after
+payload = jwt.decode(token, JWT_SECRET_KEY, options=JWT_OPTIONS, algorithms=[JWT_ALGORITHM])
+
+# before
+jwt_token = jwt.encode(payload, JWT_SECRET_KEY, JWT_ALGORITHM)
+data = {"jwt-token": jwt_token.decode("utf-8")}
+# after
+jwt_token = jwt.encode(payload, JWT_SECRET_KEY, JWT_ALGORITHM)
+data = {"jwt-token": jwt_token}
+```
+### 1.2 Web Interface Broken
+Secondly, after some dependabot updates, the webapp was completely broken. Browsing to any of the tool's urls, you would see this:
+```
+  File "/home/owtf/owtf-venv/lib/python3.9/site-packages/tornado/web.py", line 1590, in _execute
+    result = method(*self.path_args, **self.path_kwargs)
+  File "/home/owtf/owtf-venv/lib/python3.9/site-packages/owtf-2.6.0-py3.9.egg/owtf/api/handlers/index.py", line 35, in get
+    self.render("index.html")
+  File "/home/owtf/owtf-venv/lib/python3.9/site-packages/tornado/web.py", line 766, in render
+    html = self.render_string(template_name, **kwargs)
+  File "/home/owtf/owtf-venv/lib/python3.9/site-packages/tornado/web.py", line 904, in render_string
+    t = loader.load(template_name)
+  File "/home/owtf/owtf-venv/lib/python3.9/site-packages/tornado/template.py", line 425, in load
+    self.templates[name] = self._create_template(name)
+  File "/home/owtf/owtf-venv/lib/python3.9/site-packages/tornado/template.py", line 452, in _create_template
+    with open(path, "rb") as f:
+FileNotFoundError: [Errno 2] No such file or directory: '/home/owtf/.owtf/build/index.html'
+```
+
+I created [this issue](https://github.com/owtf/owtf/issues/1271) and immediately jumped into investigating it. 
+
+At first I was pretty certain it had to be because dependabot updated **tornado** from version 5 to 6. I logged into the container and started looking for the `index.html` file, but it was not even present in the filesystem.
+It came to me that the web interface was not built properly. I started looking at the ``scripts/install.sh`, and found the web interface installation section:
+
+```
+# ======================================
+#   SETUP WEB INTERFACE DEPENDENCIES
+# ======================================
+
+ui_setup() {
+    # Download community written templates for export report functionality.
+    if [ ! -d "${ROOT_DIR}/webapp/src/containers/Report/templates" ]; then
+        echo "${warning} Templates not found, fetching the latest ones...${reset}"
+        git clone https://github.com/owtf/templates.git "$ROOT_DIR/webapp/src/containers/Report/templates"
+    fi
+
+    if [ ! -d ${NVM_DIR} ]; then
+        # Instead of using apt-get to install npm we will nvm to install npm because apt-get installs older-version of node
+        echo "${normal}[*] Installing npm using nvm.${reset}"
+        wget https://raw.githubusercontent.com/creationix/nvm/v0.31.1/install.sh -O /tmp/install_nvm.sh
+        bash /tmp/install_nvm.sh
+        rm -rf /tmp/install_nvm.sh
+    fi
+
+    # Setup nvm and install node
+    . ${NVM_DIR}/nvm.sh
+    echo "${normal}[*] Installing NPM...${reset}"
+    nvm install 18
+    nvm alias default node
+    echo "${normal}[*] npm successfully installed.${reset}"
+
+    # Installing webpack and gulp globally so that it can used by command line to build the bundle.
+    npm install -g yarn
+    # Installing node dependencies
+    echo "${normal}[*] Installing node dependencies.${reset}"
+    TMP_DIR=${PWD}
+    cd ${ROOT_DIR}/webapp
+    yarn --silent
+    echo "${normal}[*] Yarn dependencies successfully installed.${reset}"
+
+    # Building the ReactJS project
+    echo "${normal}[*] Building using webpack.${reset}"
+    yarn build &> /dev/null
+    echo "${normal}[*] Build successful${reset}"
+    cd ${TMP_DIR}
+}
+```
+
+Following what the script does, I went into the **webapp** directory and ran `yarn build` to see what's going on. Do observe that the build process is redirected to **/dev/null**, so we have no idea if it fails or succeeds. No other build process gets affected if it fails too.
+
+TL;DR the problem was a bunch of "X requires Y version z ...". The most stable set of changes I found was to set the **node** version to **18.12**, and revert **css-loader** to **0.28.11**. 
+
+There were 2 more less serious problems. 
+- The **Transaction** page, which is used to display the Request/Response pairs exchanged with the target, didn't show any transactions. Checking the api calls to the backend, I found that they were al 403s. This was because the Authorization Header was not included. I have no idea why the developer working on the web interface missed this for the Transaction page only.
+- The links to the file server doesn't lead to the correct path. Simply adding a `target="_blank"` to open up a new window on click resolved the issue. Literally!
+
+Here's [the merge PR](https://github.com/owtf/owtf/pull/1278/files).
+
+## 2. Updating the Information Gathering plugins
+[Link to the PR](https://github.com/owtf/owtf/commit/402f8f8db6fd53cb47c5a438f92dec8826a2ac98)
+
+As mentioned, OWTF follows the [OWASP Web Testing Guide](https://owasp.org/www-project-web-security-testing-guide/). I chose to work on **Information Gathering** because most of the time (if not always) that's the first thing to do in any security testing engagement. 
+I identified these as major aspects to focus on:
+- **Search Engine Discovery** (maybe you can find something you shouldn't)
+- **Subdomain and Asset Enumeration** (maybe microservices are vulnerable)
+- **Web Server Fingerprinting** (Pretty sure you can't SSTI plain html server)
+- **Content Discovery and Active Probing** (Opens up attack surfaces)
+
+For my choices of tools, I knew that guides from organizations like OWASP or Portswigger are generic and wouldn't provide enough on tools' use cases and best practices.
+That's when I turned to the Bug Bounty community, where the incentive creates an environment where people come up with the most efficient and effective instruments.
+I binge-watched [Jason Haddix](https://github.com/jhaddix)'s Bug Hunter Methodology videos, got my hands dirty testing some of the tools and methods on live bug bounty targets on HackerOne. 
+Though successful bug hunters utilized sophisticated automation framework or just very good manual hunters, I found that [Project Discovery](https://github.com/projectdiscovery)'s open sourced tools are great for grabbing low hanging fruits, which actually is perfect for OWTF.
+I'll dig deeper into each tools that I added right below.
+
+### 2.1 Search Engine Discovery
+Apart from fixing the infamous [theHarvester](https://github.com/laramies/theHarvester) to work properly, I added [GAU](https://github.com/lc/gau). It stands for **get all urls**. What it does is fetching known urls from different sources like Wayback. 
+Sometimes wordlists can't discover application specific assets. This is especially true for non-English-speaking countries, where they name files and directories very differently. That's when GAU comes in valuable.
+Apart from those, [metagoofil](https://github.com/opsdisk/metagoofil) also helps gather files by utilizing google dorking queries.
+
+### 2.2 Subdomain and Asset Enumeration
+The existing [dnsrecon](https://github.com/darkoperator/dnsrecon) does a very good job finding subdomains and outputing XML format, which is better than plain stdin output when viewing from the fileserver.
+However, the general bug hunters concensus is that it's better to use several subdomain discovery tools, as each one uses slightly different methods, and one might be better than the others at specific targets.
+Thus, I added OWASP's dear child [amass](https://github.com/owasp-amass/amass). It does subdomain bruteforcing and additionally provides ASN information, giving you related public IP subnets that you can scan and maybe discover public facing vulnerable services.
+
+### 2.3 Web Server Fingerprinting
+OWTF previously relies on **httprint** and **whatweb** for fingerprinting, however the two are both barely maintained. [Wappalyzer](https://www.wappalyzer.com/) is the defacto standard, however it recently became close-source.
+You can use the browser extension for free, but it's a bit inconvenient to not be able to collect the data programmatically. 
+Of course, the bug hunter world has a bunch of tool for this task. However, upon testing those tools, I concluded that they either fetch Wappalyzer or similar APIs or just a scrappy rewrite of the once open-source Wappalyzer.
+Moreover, **whatweb** level 3 and higher actually stall the system, consuming all memory (I tested on my Kali machine with 8GB ram, even worse in a container).
+
+In the end, I decided that it's best to skip this part for OWTF. It's better to just go use the Wappalyzer browser extension, or use the API of the paid version. Besides, a lot of things can be infered about the webserver from other types of discovery.
+
+### 2.4 Content Discovery and Active Probing
+There are 3 things I want to talk about
+- Have you ever done recon on HackTheBox or TryHackMe where gobuster just goes 1000 requests per second and get all you need? Well most modern websites sit behind a load balancer and have proper rate limiting. 
+After discussing with my mentors, I concluded that OWTF should stop on 429, and it's the users' job to figure out the right way to do enumeration and respect the websites' rate limiting (whether it be proxychains + tor, lower the frequency, etc).
+Conveniently, [dirsearch](https://github.com/maurosoria/dirsearch) provides this exact option with **--stop-on-429**. I set it to be the Content Discovery option for OWTF instead of gobuster and dirbuster.
+- Remember all the known endpoints generated by GAU mentioned above? There should be something done with them right? Again, ProjectDiscovery has the perfect tool for it - [httpx](https://github.com/projectdiscovery/httpx).
+It has many probing options that allow us to discover the current state of those known urls. GAU's output can be piped directly into htttpx - yippe!.
+- Portscan should be done to discover public facing services. **nmap** is the defacto standard, because although not as fast as other alternatives, it has an extensive database of scripts fingerprint the service on ports and probe for vulnerabilities/inconsistencies.
+There's a problem, **nmap** requires network capabalities, it's most of the time raw socket access. Me and my mentors agreed that granting containers those privileges might open up doors for [privilege escalation](https://book.hacktricks.xyz/linux-hardening/privilege-escalation/docker-security/docker-breakout-privilege-escalation#capabilities-abuse-escape).
+We ultimately came to the solution of letting the users choose at their own disposal, we created a `make compose-safe` and `make compose-unsafe` options. 
+
+Finally before commiting changes, I ran a final check to see if any tools may take up all memories and stall the system. Luckily after all the old tools are pruned, things all run smoothly. 
+
+# Epilogue
+I would like to thank my mentors **Viyat Bhalodia**, **Abraham Aranguren** for the opportunity and the guidance. Kudos to Pratham Agarwal and Rahul Surwade for also contributing to the project this summer and communicating changes with me.
+
+I'll be back for GSoC Next year!

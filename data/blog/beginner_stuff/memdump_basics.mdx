@@ -1,0 +1,105 @@
+---
+title: Comprehensive Introductory Memory Dump Forensics with Volatility
+date: '2024-08-22'
+tags: ["beginner_stuff", "forensics"]
+draft: false
+summary: Keeping this so I don't have to google a bunch of stuff next time ;)
+---
+
+# Foreword
+
+I recently completed HackTheBox's [Recollection](https://app.hackthebox.com/sherlocks/Recollection) Sherlock (it's a forensic walkthrough challenge).
+It was not my first time doing memory forensic stuff with volatility, but I still had to google a lot and keep a bunch of tabs open (to the point it was hard finding things).
+The Sherlock was really good, straightforward and requiring me to touch on lots of aspects of memdump investigation. Thus I think I should note down what I've learned for future references and maybe help out some fellow readers.
+
+# The Volatility Framework, Version 2 and 3, Python 2 and 3.
+
+So at the start I got volatility3 on my machine and just jump straight into it. It was all good until question 3, which asked for commands typed on the console. Somehow the *windows.cmdline.CmdLine* plugin did not get the commands I needed to find.
+
+I looked this up in the HackTheBox discord channels, and everybody mentioned that I have to use volatility2, the version that has to be run with the **deprecated** python2.
+
+I did a tiny bit of research on vol2 vs vol3 and found out that version 2 is a well established one, hasn't got updated in 4 years, but it's till widely utilized today.
+Version 3 is in active development, is a write-from-scratch effort to satisfy requirements such as to be used as a Python library or allow easy plugin development. 
+
+There're a lot of guides and blogs on how to install vol2, but here I'll just document some quirks I saw along the way:
+- First, I dont want to do the **setup install** script stuff, mainly because I just want to run it as a Python script with python2. So there are some problems
+- There are dependencies to be installed and, well pip doesn't come with python2 anymore. Follow [this thread](https://github.com/volatilityfoundation/volatility/issues/771) for the fix.
+- PyCrypto is deprecated and said contain security vulnerabilities, but imvho using it for forensics would be fine, especially when you're likely to be sandboxing your investigation work.
+- I did not get the *yarascan* plugins to work properly, but it works on **vol3** so I didn't bother looking into a fix. This will not be the only time I mention **vol3** as a fix.
+
+# Cheatsheet
+## First things first
+
+You can run **vol.py** with the *-h* flags to get the detailed format, but basically it's pretty much just this:
+```py
+python2 vol.py -f [the memory file here] --profile=[The memory profile] [plugins to run] [insert other options and flags here]
+```
+
+Firstly, you **MUST** run the **imageinfo** plugin. It will give you some OS and kernel information, but most importantly you'll be suggested some **profiles** to use, without them most plugins would complain and can't run properly.
+
+## Resources
+
+Before we mention specific plugins, the [official documentation](https://github.com/volatilityfoundation/volatility/wiki/Command-Reference) is what you can't miss.
+
+And the cheatsheet for [Volatility3](https://cheatography.com/bpdzone/cheat-sheets/volatility-3-0-windows/)
+
+## Command Line
+Alright, after **imageinfo**, the most simple thing to grasp is Command Line stuff. You can use one of the 2 plugins
+```
+cmdscan
+consoles
+```
+
+Personally for me while during the Sherlock I found that **consoles** is more intuitive. The output looks like what the console would be at the time.
+
+## Processes
+Basic Processes investigation includes
+
+```
+pslist
+pstree 
+psscan
+```
+
+The first is the most simple form. The tree options lets you see a hierachy of parent-child processes, and psscan can unveil hiddened, unlinked, terminated processes.
+They say rootkit can't hide from **psscan**.
+
+## Files  
+
+**filescan** will list out filenames along with physical offset, rwx access information, and number of pointers to that object. Those will be pretty useful information for further findings, and of course pair this with **grep** for digging gold.
+
+**dumpfile** lets you grab the file content. 2 options to note are *-Q* specifying the physical offset (probably obtained above) or *-r* to filter by regex.
+
+To check files using the Master Boot Records, use the **mbrparser** plugin
+
+I like to use **mftparser** more because it gives the files' creation, modified, mft altered and access date, which should be very meaning.
+
+## Networking
+
+These are very intuitive, I'm just listing them out. One problem is that some of these don't work with certain profiles. My solution is to use the **Version 3** alternatives
+```
+connections
+connscan
+sockets
+sockscan
+netscan
+```
+
+## To be learned
+
+Kernel investigation along with Registry shenanegans are the things on the harder side that I want to learn. I'll comeback to each of these on separate posts.
+
+# Thoughts on learning forensics and forming applicable real world methodologies
+
+Things like HackTheBox's Sherlocks and Forensic CTF challenges provide a set of questions and clear objectives which help you learn the tools and get your hands dirty.
+While this is good for picking up the basic skills, it's very far from real life, definitely relatively further than other CTF categories. Let's think about a few points:
+- Let say the attacker left an email trail. In a challenge setting, I would just do **strings [memfile] | grep gmail.com** and guess the answer. There are similar cases. Sometimes you forget the learning and figuring out, and more on the achievement and joy of getting the right answer.
+- In real life, you just know one or more bad things had happened. You gotta pick up the pieces, form connections, make experienced guesses, etc; without a guiding Prompt
+- Advance adversarial techniques that require solid knowledge of Cryptography, Reverse Engineering, Networking, OS internals, and more
+- Think of a ransomware attack. What is the priority then? Recover files by finding loopholes in the malware? Search for backdoors? Just find the vulnerabilities and start patching and backing up already?
+
+Thus there must be a methodology, analogous to something like Red Team's / Bounty Hunter's. 
+
+Then more on learning, finally. To be able to do digital forensics exceptionally, then you probably need to be very solid on most (if not all) related Computer Science topics (or your team should be, cummulatively). Yes, playing things like Sherlocks and CTF helps but think about it. It's hard to make a good challenge that lets you learn advance, real-er techniques. Getting good is also about learning the related things and just dive in to the real battles. Basically my point is you can't rely on one thing, and you gotta put in hellah an effort.
+
+# ENOUGH FOR TODAY, HAPPY HACKING (OR DEFENDING)!

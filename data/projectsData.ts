@@ -6,14 +6,13 @@ interface Project {
 }
 
 const projectsData: Project[] = [
-  // {
-  //   title: 'A Search Engine',
-  //   description: `What if you could look up any information in the world? Webpages, images, videos
-  //   and more. Google has many features to help you find exactly what you're looking
-  //   for.`,
-  //   imgSrc: '/static/images/google.png',
-  //   href: 'https://www.google.com',
-  // },
+  {
+    title: 'Google Summer Of Code 2024 Project Recap',
+    description: `OWTF doesn't stand for "Oh, WTF?" but OWASP Web Testing Framework. During the summer, I worked on improving this project, from fixing serious webapp and dependency bugs to refactoring enumeration plugins to modern standards.
+    For more technical details and thoughts, follow the link to my writeup for the project below`,
+    imgSrc: '/static/images/GSoCBanner.png',
+    href: '/blog/project_blogs/gsoc24',
+  },
   // {
   //   title: 'The Time Machine',
   //   description: `Imagine being able to travel back in time or to the future. Simple turn the knob
